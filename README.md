@@ -39,10 +39,9 @@ User → NGINX → Streamlit (EC2) → AWS Lambda → Amazon Bedrock (DeepSeek)
                                    S3 Logs
                                       ↓
                                    SNS Alerts
-
-<img width="936" height="574" alt="image" src="https://github.com/user-attachments/assets/0cd03c30-8128-4ca8-acb7-153f7f8d8c58" />
-
 ```
+
+<img width="936" height="574" alt="image" src="https://github.com/user-attachments/assets/59c827e3-6e53-4c66-8d70-3d1070280bff" />
 
 ---
 
