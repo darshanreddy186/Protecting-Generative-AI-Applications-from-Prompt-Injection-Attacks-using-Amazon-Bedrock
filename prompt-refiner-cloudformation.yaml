@@ -1,0 +1,354 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CloudFormation template to deploy Prompt Refiner AI (Streamlit on EC2,
+  Bedrock access via IAM role, SNS -> Lambda -> Pushover alerts, VPC,
+  SecurityGroups). .  
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the Streamlit server
+
+  SSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Allowed source IP CIDR for SSH (e.g. your IP/32)
+
+  PushoverUserKey:
+    Type: String
+    NoEcho: true
+    Description: Pushover user key used by Lambda
+
+  PushoverApiToken:
+    Type: String
+    NoEcho: true
+    Description: Pushover application token used by Lambda
+
+  GitRepoUrl:
+    Type: String
+    Default: https://github.com/mazda4409/prompt-refiner-ai.git
+    Description: Git repository to clone for the Streamlit application
+
+  LatestAmiParameterName:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: SSM Parameter name containing the latest AMI ID (defaults to Amazon Linux 2)
+
+Conditions:
+  AllowAnywhereSSH: !Equals [ !Ref SSHLocation, 0.0.0.0/0 ]
+
+Resources:
+  # ---------------- VPC / Networking ----------------
+  PromptVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: prompt-refiner-vpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PromptVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: prompt-refiner-public-subnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: prompt-refiner-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref PromptVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PromptVPC
+      Tags:
+        - Key: Name
+          Value: prompt-refiner-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------- Security Group ----------------
+  PromptSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Prompt Refiner EC2 instance
+      VpcId: !Ref PromptVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: prompt-refiner-sg
+
+  # ---------------- IAM Roles ----------------
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: PromptRefinerBedrockPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowSNSandPushover
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: '*'
+
+  # ---------------- EC2 Instance ----------------
+  PromptRefinerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !Ref LatestAmiParameterName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref PromptSecurityGroup
+      Tags:
+        - Key: Name
+          Value: prompt-refiner-ec2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # update & install dependencies
+          yum update -y
+          yum install -y git python3 python3-pip nginx
+          pip3 install --upgrade pip
+
+          # clone application
+          cd /home/ec2-user
+          rm -rf prompt-refiner-ai || true
+          git clone ${GitRepoUrl} prompt-refiner-ai
+          chown -R ec2-user:ec2-user prompt-refiner-ai
+
+          # write environment variables
+          cat > /home/ec2-user/prompt-refiner-ai/.env <<'EOF'
+          PUSHOVER_USER_KEY=${PushoverUserKey}
+          PUSHOVER_API_TOKEN=${PushoverApiToken}
+          AWS_REGION=${AWS::Region}
+          EOF
+          chown ec2-user:ec2-user /home/ec2-user/prompt-refiner-ai/.env
+
+          # install python deps
+          cd /home/ec2-user/prompt-refiner-ai
+          pip3 install -r requirements.txt
+
+          # configure nginx as reverse proxy to Streamlit
+          cat > /etc/nginx/conf.d/streamlit.conf <<'NGINX'
+          server {
+              listen 80 default_server;
+              server_name _;
+
+              location / {
+                  proxy_pass http://127.0.0.1:8501;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+              }
+          }
+          NGINX
+
+          systemctl enable nginx
+          systemctl restart nginx
+
+          # run streamlit app as ec2-user (background)
+          su - ec2-user -c "nohup streamlit run /home/ec2-user/prompt-refiner-ai/myapp.py --server.port 8501 --server.address 0.0.0.0 > /home/ec2-user/streamlit.log 2>&1 &"
+
+  # ---------------- SNS Topic & Lambda ----------------
+  PromptAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: PromptRefinerAlerts
+
+  AlertLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: prompt-refiner-alert-lambda
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          PUSHOVER_API_TOKEN: !Ref PushoverApiToken
+          PUSHOVER_USER_KEY: !Ref PushoverUserKey
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          def send_pushover(message_text):
+              token = os.environ.get('PUSHOVER_API_TOKEN')
+              user = os.environ.get('PUSHOVER_USER_KEY')
+              if not token or not user:
+                  return
+              data = urllib.parse.urlencode({
+                  'token': token,
+                  'user': user,
+                  'message': message_text
+              }).encode('utf-8')
+              req = urllib.request.Request('https://api.pushover.net/1/messages.json', data=data)
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  resp.read()
+
+          def lambda_handler(event, context):
+              # SNS event -> send pushover for each message
+              for record in event.get('Records', []):
+                  sns_message = record.get('Sns', {}).get('Message', '{}')
+                  try:
+                      msg = json.loads(sns_message)
+                  except Exception:
+                      msg = {'text': sns_message}
+                  text = msg.get('message') or msg.get('text') or str(msg)
+                  send_pushover(f"Prompt Refiner Alert: {text}")
+              return {'status': 'ok'}
+
+  LambdaPermissionForSNS:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref PromptAlertsTopic
+
+  SNSTopicSubscriptionToLambda:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PromptAlertsTopic
+      Protocol: lambda
+      Endpoint: !GetAtt AlertLambdaFunction.Arn
+
+  # ---------------- Optional: S3 for logs (placeholder) ----------------
+  PromptRefinerLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: prompt-refiner-logs
+
+Outputs:
+  WebsiteURL:
+    Description: URL for the Streamlit application (http)
+    Value: !Sub "http://${PromptRefinerInstance.PublicDnsName}"
+
+  EC2PublicIP:
+    Description: EC2 Public IP
+    Value: !GetAtt PromptRefinerInstance.PublicIp
+
+  SNSTopicArn:
+    Description: SNS Topic ARN for alerts
+    Value: !Ref PromptAlertsTopic
+
+  S3LogBucket:
+    Description: S3 bucket for logs
+    Value: !Ref PromptRefinerLogBucket
